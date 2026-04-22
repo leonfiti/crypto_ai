@@ -1,0 +1,212 @@
+CRYPTO_AI — CONTEXTO COMPLETO (estado actual) — para pegar en otro chat
+=====================================================================
+
+0) Objetivo del proyecto
+------------------------
+Construir un sistema de trading cuantitativo (primero en modo “paper”/test) sobre Binance Spot para BTCUSDT,
+basado en un modelo ML que produzca probabilidades y una política de decisión (cuándo entrar/salir) evaluada
+con backtesting con comisiones reales.
+
+Fases:
+A) Pipeline de datos + modelo + predicción de probabilidad (OK).
+B) Logging autónomo (OK).
+C) Evaluación (OK).
+D) Backtesting con comisiones (en progreso; se detectó que el edge se lo comen las fees).
+E) Bot conectado a Binance (POSPUESTO: solo cuando haya estrategia rentable neta).
+
+Hardware/OS: Windows 11, RTX 4070, 32GB RAM.
+Entorno Python: conda env “cryptoai” (Python 3.11).
+
+Fee Spot asumida:
+- Binance spot “taker” típico ~0.1% por lado (0.001). Round-trip ~0.2% (0.002) sin slippage.
+
+1) Estructura del proyecto
+--------------------------
+C:\crypto_ai\
+  src\
+    features.py
+    01_download_klines.py
+    02_build_dataset.py
+    03_train_model.py
+    04_predict_latest.py
+    07_log_probabilities.py
+    08_evaluate_predictions.py
+    09_sweep_train.py
+    10_run_loggers.py
+    11_backtest_policy.py
+    12_build_dataset_barrier.py
+    13_train_barrier_model.py
+    14_backtest_barrier_offline.py
+  data\
+    BTCUSDT_1m_raw.parquet
+    BTCUSDT_1m_dataset_h*_thr*.parquet
+    BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.parquet
+  models\
+    model_BTCUSDT_1m_h5_thr0.001.joblib
+    model_BTCUSDT_1m_h10_thr0.001.joblib
+    model_BTCUSDT_1m_h15_thr0.001.joblib
+    BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.joblib
+  logs\
+    preds_BTCUSDT_1m_h5_thr0.001.csv
+    preds_BTCUSDT_1m_h10_thr0.001.csv
+    preds_BTCUSDT_1m_h15_thr0.001.csv
+    preds_barrier_tp0.008_sl0.003_hold45.csv
+    preds_eval_*.csv (salidas de 08)
+
+2) Entorno e instalación
+------------------------
+Conda:
+  conda create -n cryptoai python=3.11 -y
+  conda activate cryptoai
+
+Paquetes (pip):
+  pandas numpy pyarrow scikit-learn xgboost joblib matplotlib python-dotenv requests websockets
+
+Incidencias resueltas:
+- Conda pedía aceptar Terms of Service (conda tos accept ...).
+- En PowerShell salía “python no encontrado” por alias Microsoft Store; se usó Anaconda Prompt.
+- CSV con esquemas distintos causaba ParserError; se añadieron rotaciones/chequeos de cabecera.
+- pandas tz-aware (datetime64[ms, UTC]) rompía np.issubdtype; se cambió a pandas.api.types.
+- sklearn 1.8 no acepta CalibratedClassifierCV(cv="prefit"); se implementó Platt scaling manual.
+
+3) “Modelo direccional” (primer enfoque)
+----------------------------------------
+Idea inicial:
+- Predecir si el precio sube o baja en H minutos (H=5,10,15) en velas 1m.
+- Se creó dataset con umbral thr=0.001 para descartar “neutrales” (abs(ret)<=0.1%) en el entrenamiento.
+
+Scripts:
+- 01_download_klines.py: descarga klines 1m (BTCUSDT) y guarda parquet (raw).
+- features.py: coerción de dtypes + compute_features() (retornos, wicks, vol, EMAs, microestructura).
+- 02_build_dataset.py: genera dataset direccional (future_ret y etiqueta y).
+- 03_train_model.py: XGBoost + calibración (LogReg sobre p_raw); split temporal con gap=H.
+- 04_predict_latest.py: predicción “one-shot” de la última vela cerrada.
+- 07_log_probabilities.py: logger autónomo (1 fila por vela cerrada) a CSV.
+- 08_evaluate_predictions.py: evalúa el CSV vs futuro real (SIGNO y FILTRADA por thr).
+
+Resultados (offline sweep con 09_sweep_train.py, thr=0.001):
+- H=5  AUC ~0.5197
+- H=10 AUC ~0.5346
+- H=15 AUC ~0.5336
+Conclusión: H=10/15 mejor que H=5.
+
+Resultados “online” con logs + 08:
+- H=10 y H=15 mostraban separación top/bottom por cuantiles, pero al hacer backtest con fees
+  (11_backtest_policy.py) la estrategia típica quedaba negativa.
+- Diagnóstico: hay edge pequeño, pero no paga la fricción (0.1% por lado).
+
+4) Backtest de política con fees (11_backtest_policy.py)
+--------------------------------------------------------
+Objetivo: simular una política long-only spot con TP/SL/tiempo/exit por probabilidad, usando OHLC real.
+Se detectaron y corrigieron:
+- colisión de columnas “close” al hacer merge con precios (close_x/close_y) -> renombrado m_close/m_high/m_low.
+- definición de TP/SL respecto al precio de mercado vs precio ejecutado con fees (evitar sesgos).
+
+Conclusión del enfoque direccional:
+- Con fee=0 (sin comisiones) el grid mostraba configs con equity > 1 (hay señal).
+- Con fee=0.001 por lado, el grid quedaba < 1 casi siempre (fees se comen el edge).
+
+5) Cambio de enfoque: “Triple-Barrier / Barrier model” (modelo alineado a TP/SL)
+--------------------------------------------------------------------------------
+Motivo:
+- Para scalping con fees, es mejor entrenar el modelo para “probabilidad de ganar un trade”
+  (tocar TP antes que SL en un tiempo máximo) en lugar de “sube/baja a H minutos”.
+
+Configuración barrier elegida:
+- TP = +0.8% (0.008)
+- SL = -0.3% (0.003)
+- max_hold = 45 minutos
+
+Script 12_build_dataset_barrier.py:
+- Construye dataset con etiqueta:
+  y=1 si se toca TP antes que SL dentro de max_hold,
+  y=0 si se toca SL antes que TP,
+  se descartan timeouts.
+Resultado:
+- data\BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.parquet
+- Rows: 177,447
+- y=1 ratio: 0.130 (clase positiva ~13%)
+
+Script 13_train_barrier_model.py:
+- XGBoost + Platt scaling (LogReg).
+- Split temporal con gap=max_hold (45).
+Resultado:
+- TEST AUC: 0.5776
+- TEST BRIER: 0.133392
+- Modelo guardado: models\BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.joblib
+
+Interpretación:
+- La probabilidad del barrier model significa:
+  P(tocar TP antes que SL dentro de 45 min), no “sube/baja”.
+- p_up calibrada queda comprimida; p_raw tiene más rango y suele ser mejor “score” de ranking.
+
+6) Logging barrier (07)
+-----------------------
+Se lanzó el logger con:
+  python src\07_log_probabilities.py --model models\BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.joblib --out logs\preds_barrier_tp0.008_sl0.003_hold45.csv
+
+Nota:
+- El logger escribe 1 fila por vela cerrada; para estrategias con max_hold=45, la métrica clave no son “filas”
+  sino “número de trades posibles” (por no-solape).
+- Con pocas filas (p.ej. 86 o 700), el grid de estrategias puede generar pocos trades (2–8) y no es concluyente.
+
+7) Backtest OFFLINE barrier (14_backtest_barrier_offline.py)
+-------------------------------------------------------------
+Se creó un backtest offline para no depender de esperar días de logs.
+Incidencias y fix:
+- pandas 3: Series no tiene .view() -> se cambió a .astype('int64').
+- Para evitar problemas de timestamp, se cambió el “salto” no-solapado a salto por índice:
+  i += t_hit + 1 (t_hit está en minutos).
+
+Diagnóstico del dataset:
+- t_hit min=1, max=45
+- open_time sin NaT y ordenado
+- timestamps ordenados OK
+
+Resultado del backtest offline (fee=0.001 por lado, TP=0.008, SL=0.003):
+- Se imprimieron configs por quantiles de entrada.
+- Con muchos trades (miles), la equity compuesta resultó negativa para todos los entry_q probados.
+- Winrates observados típicamente ~0.19–0.42 dependiendo del entry_q, por debajo del break-even necesario.
+  Break-even aproximado:
+    TP neto ≈ +0.005986 (0.5986%)
+    SL neto ≈ -0.004992 (-0.4992%)
+    Winrate mínimo para EV≥0: w > 0.454
+
+Conclusión actual:
+- Aunque el modelo barrier mejora la AUC y está alineado con la estrategia, con TP/SL escogidos y fee 0.1%/lado,
+  la selección por umbral/percentil aún no logra superar el break-even en el backtest offline (según la simulación actual).
+
+8) Qué se ha aprendido / estado actual
+--------------------------------------
+- Pipeline completo funciona: descarga -> features -> dataset -> entrenamiento -> logging -> evaluación.
+- Señal existe (en tests sin fees y en métricas de ranking), pero fees en spot son críticas.
+- El cambio a triple-barrier es el camino correcto para alinear con rentabilidad, pero aún hay que:
+  - ajustar TP/SL/hold (buscar una combinación con mejor ratio win/avg_ret neto),
+  - reducir fricción (descuento BNB, maker),
+  - o hacer la política más selectiva / menos churn,
+  - o reentrenar barrier con otra parametrización (p.ej. TP mayor, SL distinto, hold distinto),
+  - o evaluar en otro régimen/activo/mercado.
+
+9) Comandos principales (resumen)
+---------------------------------
+Direccional:
+  python src\01_download_klines.py
+  python src\02_build_dataset.py
+  python src\03_train_model.py
+  python src\04_predict_latest.py
+  python src\10_run_loggers.py --new-console
+  python src\08_evaluate_predictions.py --preds logs\preds_BTCUSDT_1m_h10_thr0.001.csv
+  python src\11_backtest_policy.py --preds logs\preds_BTCUSDT_1m_h10_thr0.001.csv --use p_raw --fee 0.001 --grid
+
+Barrier:
+  python src\12_build_dataset_barrier.py --tp 0.008 --sl 0.003 --max_hold 45
+  python src\13_train_barrier_model.py --ds data\BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.parquet --gap 45
+  python src\07_log_probabilities.py --model models\BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.joblib --out logs\preds_barrier_tp0.008_sl0.003_hold45.csv
+  python src\14_backtest_barrier_offline.py --ds data\BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.parquet --model models\BTCUSDT_1m_barrier_tp0.008_sl0.003_hold45.joblib --tp 0.008 --sl 0.003 --fee 0.001 --use p_raw --min_trades 200
+
+10) Nota de seguridad
+---------------------
+Hasta ahora NO se ejecutan órdenes reales. Solo logging, evaluación y backtest.
+El bot conectado a Binance (test/paper) se implementará cuando haya evidencia de rentabilidad neta con fees.
+
+Fin del contexto.
